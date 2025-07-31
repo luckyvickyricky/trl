@@ -304,9 +304,8 @@ class RLOOTrainer(Trainer):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
-                queries = data["input_ids"].to(device)
-                queries = queries.repeat(args.rloo_k, 1)
-                context_length = queries.shape[1]
+                original_queries = data["input_ids"].to(device)
+                context_length = original_queries.shape[1]
                 responses = []
                 postprocessed_responses = []
                 logprobs = []
@@ -314,17 +313,35 @@ class RLOOTrainer(Trainer):
                 scores = []
                 sequence_lengths = []
 
-                # Generate responses and compute logprobs
+                # Generate responses using RepeatSampler approach (GRPO style)
+                # Avoid memory replication by using original queries multiple times
                 with unwrap_model_for_generation(
                     self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
                 ) as unwrapped_model:
-                    query_responses, logitss = batch_generation(
-                        unwrapped_model,
-                        queries,
-                        args.local_rollout_forward_batch_size,
-                        processing_class.pad_token_id,
-                        generation_config,
-                    )
+                    # RepeatSampler style: generate rloo_k responses without memory replication
+                    all_query_responses = []
+                    all_logitss = []
+                    
+                    for k in range(args.rloo_k):
+                        # Use original queries directly (no memory replication)
+                        # This simulates RepeatSampler yielding the same indices rloo_k times
+                        query_responses, logitss = batch_generation(
+                            unwrapped_model,
+                            original_queries,  # Always use original, never replicate
+                            args.local_rollout_forward_batch_size,
+                            processing_class.pad_token_id,
+                            generation_config,
+                        )
+                        all_query_responses.append(query_responses)
+                        all_logitss.append(logitss)
+                    
+                    # Concatenate all results to match original API behavior
+                    query_responses = torch.cat(all_query_responses, dim=0)
+                    logitss = torch.cat(all_logitss, dim=0)
+                    
+                    # Create virtual queries for downstream processing compatibility
+                    # Note: This happens after generation, so peak memory during generation is reduced
+                    queries = original_queries.repeat(args.rloo_k, 1)
 
                 # Process responses in batches
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
